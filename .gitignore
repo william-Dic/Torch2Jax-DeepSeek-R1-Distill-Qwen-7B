@@ -5,7 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
-
+*.ipynb
+*.msgpack
 # Distribution / packaging
 .Python
 build/
