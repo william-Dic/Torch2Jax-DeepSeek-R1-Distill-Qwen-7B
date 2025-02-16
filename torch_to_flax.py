@@ -209,6 +209,12 @@ def torch_to_flax():
             bytes_output = flax.serialization.to_bytes(converted_params)
             f.write(bytes_output)
 
+    del torch_model
+    del flax_model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    del converted_params
+    del bytes_output
+
 
 if __name__ == "__main__":
     torch_to_flax()

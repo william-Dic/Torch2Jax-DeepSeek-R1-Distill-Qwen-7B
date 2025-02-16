@@ -32,13 +32,11 @@
 </p>
    
 <h4>
-    <!-- <a href="https://github.com/J-Rosser-UK/Torch2Jax-DeepSeek-R1-Distill-Qwen-1.5B/">View Demo</a> -->
-  <!-- <span> · </span> -->
-    <!-- <a href="https://docs.google.com/presentation/d/197lRGAtPoG1NWLJ_fDOLTHBlyz9eA6G35g-XNvyb9To/edit?usp=sharing">Documentation</a>
-  <span> · </span> -->
     <a href="https://github.com/J-Rosser-UK/Torch2Jax-DeepSeek-R1-Distill-Qwen-1.5B/issues/">Report Bug</a>
   <span> · </span>
     <a href="https://github.com/J-Rosser-UK/Torch2Jax-DeepSeek-R1-Distill-Qwen-1.5B/issues/">Request Feature</a>
+    <span> · </span>
+    <a href="https://colab.research.google.com/drive/1jJaAARwbsFeV5hZoffrNwFhc8i2I-7ji?usp=sharing">Colab</a>
   </h4>
 </div>
 
@@ -46,18 +44,24 @@
 
 ## Overview
 
+Colab: https://colab.research.google.com/drive/1jJaAARwbsFeV5hZoffrNwFhc8i2I-7ji?usp=sharing
+
 This repository provides both Flax (JAX) and PyTorch implementations of the DeepSeek-R1-Distill-Qwen-1.5B model. It includes:
 
+- **Inference [QUICKSTART]**:
+    - `inference.ipynb`: Contains a quickstart script to download and convert params from torch to flax, load model and perform text generation.
+
 - **Flax Implementations**:  
-  - `model_flax.py`: A version with dynamic caching for efficient autoregressive generation.  
-  - `model_flax_no_cache.py`: A variant without caching support.
-  - `model_flax_sharded.py`: A variant which shards the model parameters over devices.
+    - `model_flax_sharded.py`: [RECOMMENDED] A variant which shards the model parameters over multiple devices.
+    - `model_flax.py`: A version with dynamic caching for efficient autoregressive generation.  
+    - `model_flax_no_cache.py`: A variant without caching support.
+
 
 - **PyTorch Implementation**:  
-  - `model_torch.py`: A reference implementation in PyTorch.
+    - `model_torch.py`: A reference implementation in PyTorch.
 
 - **Conversion Script**:  
-  - `torch_to_flax.py`: A utility to convert a PyTorch checkpoint (state dictionary) into Flax parameters.
+    - `torch_to_flax.py`: A utility to convert a PyTorch checkpoint (state dictionary) into Flax parameters.
 
 ## System Requirements
 ### Single GPU

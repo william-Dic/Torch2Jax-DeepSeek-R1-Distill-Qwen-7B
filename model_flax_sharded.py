@@ -1,36 +1,19 @@
-from typing import Any, Optional, Tuple
-from functools import partial
-import flax.linen as nn
 import jax
-import jax.numpy as jnp
-import flax
 from jax import lax
-from rich import print
-from tqdm import tqdm
-import time
-import numpy as np
-
-# Add necessary imports for sharding
-from flax.core.frozen_dict import freeze, unfreeze
+import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding
 from jax.experimental.pjit import pjit
+
+import flax
+import flax.linen as nn
+
 from typing import Any, Optional, Tuple
 from functools import partial
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
-from jax import lax
 from rich import print
 from tqdm import tqdm
-import time
-
-# Add necessary imports for sharding
-from flax.core.frozen_dict import freeze, unfreeze
-from jax.sharding import PartitionSpec as P
-from jax.sharding import Mesh
-from jax.experimental.pjit import pjit
+import numpy as np
 
 
 class Qwen2Config:
@@ -621,110 +604,3 @@ class Qwen2ForCausalLM(nn.Module):
 
         # Return only the actual sequence (remove padding)
         return padded_input[:, :current_input_length]
-
-
-def init_sharded_model():
-    """Initialize a model with parameters on CPU then shard them to GPU after checkpoint loading."""
-    # Create config and model
-    config = Qwen2Config()
-    model = Qwen2ForCausalLM(config=config)
-
-    rng = jax.random.PRNGKey(0)
-    input_shape = (1, 32)
-
-    # Force initialization on CPU to avoid duplicate GPU allocations
-    with jax.default_device(jax.devices("cpu")[0]):
-        params = model.init(rng, jnp.ones(input_shape, dtype=jnp.int32))
-
-    # Get available JAX devices and create mesh
-    devices = jax.devices()
-    device_mesh = np.array(devices).reshape(-1)  # 1D mesh
-    mesh = Mesh(device_mesh, ("mp",))
-
-    partition_rules = get_partition_rules()
-
-    # Helper to match a parameter path to a partition spec
-    def get_spec(path: str):
-        for rule_path, spec in partition_rules:
-            if rule_path in path:
-                return spec
-        return None
-
-    # Build sharding specs for each param in the tree
-    def create_sharding_specs(param_tree):
-        def assign_spec(path, value):
-            # Convert tuple path into a slash-joined string
-            path_str = "/".join(str(p) for p in path)
-            matched_spec = get_spec(path_str)
-            if matched_spec is None:
-                return NamedSharding(mesh, None)
-            return NamedSharding(mesh, matched_spec)
-
-        return jax.tree_util.tree_map_with_path(assign_spec, param_tree)
-
-    sharding_specs = create_sharding_specs(params)
-
-    # IMPORTANT: Do not device_put the initial params here.
-    # They remain on CPU until we load the checkpoint.
-    return model, params, sharding_specs, mesh
-
-
-def main():
-    print("Initializing sharded model...")
-
-    from transformers import AutoTokenizer
-
-    model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    try:
-        model, params, sharding_specs, mesh = init_sharded_model()
-
-        print("params", str(params)[:100])
-
-        # ----Adding this section to load model params causes error----
-        initial_params = params["params"]
-
-        with open("flax_params.msgpack", "rb") as f:
-            loaded_bytes = f.read()
-            loaded_params = {
-                "params": flax.serialization.from_bytes(initial_params, loaded_bytes)
-            }
-
-            print("loaded params", str(loaded_params)[:100])
-
-        del initial_params
-        # After loading 'loaded_params' from disk (which might be plain NumPy arrays)
-        sharded_params = jax.tree_util.tree_map(
-            lambda x, spec: jax.device_put(x, spec), loaded_params, sharding_specs
-        )
-        print("sharded params", str(sharded_params)[:100])
-
-        # ----Section ends here----
-
-        prompt = "What is 3 + 4? <think>\n"
-        inputs = tokenizer(prompt, return_tensors="pt")
-        input_ids = jnp.array(inputs["input_ids"].numpy())
-        # Generate
-        print("Generating tokens...")
-        output = model.generate(
-            sharded_params,
-            input_ids,
-            max_new_tokens=5,
-            temperature=0.7,
-            do_sample=True,
-            prng_key=jax.random.PRNGKey(0),
-        )
-
-        # Decode using your tokenizer
-        decoded = tokenizer.decode(np.array(output[0]))
-        print("Decoded text:", decoded)
-
-    except Exception as e:
-        print(f"Generation failed with error: {str(e)}")
-        import traceback
-
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()
