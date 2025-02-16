@@ -2,7 +2,7 @@ import torch
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import freeze, unfreeze
-from model_flax import Qwen2ForCausalLM, Qwen2Config
+from model_flax_sharded import Qwen2ForCausalLM, Qwen2Config
 from transformers import AutoModelForCausalLM
 import flax.serialization
 
