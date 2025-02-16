@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from jax import lax
 from rich import print
 from tqdm import tqdm
+import time
 
 
 class Qwen2Config:
@@ -182,12 +183,12 @@ class Qwen2Attention(nn.Module):
             jnp.matmul(query_states, key_states.transpose(0, 1, 3, 2)) * self.scaling
         )
 
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+        attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.softmax(attn_weights, axis=-1)
 
         if not deterministic and self.config.attention_dropout > 0:
+
             attn_weights = nn.dropout(
                 attn_weights,
                 rate=self.config.attention_dropout,
@@ -448,8 +449,36 @@ class Qwen2ForCausalLM(nn.Module):
 
         return (loss, logits) + outputs[1:]
 
+    @partial(jax.jit, static_argnames=("self",))
+    def padded_model_step(
+        self,
+        params,
+        input_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+    ):
+        """
+        Single-step forward pass using fixed-size padded `input_ids`.
+        Returns logits for sampling instead of directly sampling.
+        """
+        outputs = self.apply(
+            {"params": params},
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            deterministic=True,
+        )
+        logits = outputs[1]
+
+        # Get the current sequence length (excluding padding)
+        curr_seq_len = jnp.sum(attention_mask, axis=-1)
+
+        # Focus on the logits at the current position
+        batch_indices = jnp.arange(logits.shape[0])
+        next_token_logits = logits[batch_indices, curr_seq_len - 1]
+        return next_token_logits
+
     def generate(
         self,
+        params,
         input_ids: jnp.ndarray,
         max_new_tokens: int,
         temperature: float = 1.0,
@@ -457,20 +486,34 @@ class Qwen2ForCausalLM(nn.Module):
         top_k: Optional[int] = None,
         prng_key: Optional[jax.random.PRNGKey] = None,
     ) -> jnp.ndarray:
-        """Generate tokens autoregressively without using KV cache."""
-        generated = input_ids
-        batch_size = generated.shape[0]
+        """
+        Use fixed-size padded generation with sampling options.
+        """
+        # Determine the padded shape
+        max_sequence_length = input_ids.shape[1] + max_new_tokens
 
-        for _ in tqdm(range(max_new_tokens)):
-            # Model forward pass with full sequence
-            outputs = self(
-                input_ids=generated,
-                deterministic=True,
+        # Prepare padded buffers
+        padded_input = jnp.pad(
+            input_ids,
+            ((0, 0), (0, max_sequence_length - input_ids.shape[1])),
+            constant_values=0,
+        )
+        attention_mask = jnp.ones_like(input_ids)
+        attention_mask = jnp.pad(
+            attention_mask,
+            ((0, 0), (0, max_sequence_length - attention_mask.shape[1])),
+            constant_values=0,
+        )
+
+        # Autoregressive loop
+        for i in tqdm(range(max_sequence_length - input_ids.shape[1])):
+            # Get logits from JIT-compiled single-step
+            next_token_logits = self.padded_model_step(
+                params, padded_input, attention_mask
             )
-            logits = outputs[1]
 
-            # Get logits for last token and scale by temperature
-            next_token_logits = logits[:, -1, :] / temperature
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
 
             # Optionally apply top-k
             if top_k is not None:
@@ -490,8 +533,26 @@ class Qwen2ForCausalLM(nn.Module):
             else:
                 next_token = jnp.argmax(probs, axis=-1)
 
-            # Append generated token
-            next_token = next_token[:, None]  # Add sequence dimension
-            generated = jnp.concatenate([generated, next_token], axis=1)
+            # Reshape next token and update sequences
+            next_token = next_token.reshape(1, 1)
+            already_generated = jnp.concatenate([input_ids, next_token], axis=1)
 
-        return generated
+            # Update padded input for next iteration
+            padded_input = jnp.pad(
+                already_generated,
+                ((0, 0), (0, max_sequence_length - already_generated.shape[1])),
+                constant_values=0,
+            )
+
+            # Update attention mask
+            new_attention = jnp.ones_like(already_generated)
+            attention_mask = jnp.pad(
+                new_attention,
+                ((0, 0), (0, max_sequence_length - new_attention.shape[1])),
+                constant_values=0,
+            )
+
+            # Update input_ids for next iteration
+            input_ids = already_generated
+
+        return input_ids

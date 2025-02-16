@@ -484,7 +484,6 @@ class Qwen2ForCausalLM(nn.Module):
             use_bias=False,
             dtype=self.param_dtype,
             param_dtype=self.param_dtype,
-            # kernel_init=initializers.normal(stddev=0.02),  # Added initialization
         )
 
     def __call__(
@@ -492,30 +491,26 @@ class Qwen2ForCausalLM(nn.Module):
         input_ids: jnp.ndarray,
         attention_mask: Optional[jnp.ndarray] = None,
         position_ids: Optional[jnp.ndarray] = None,
-        past_key_values: Optional[DynamicCache] = None,
         inputs_embeds: Optional[jnp.ndarray] = None,
         labels: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
-        **kwargs,
     ):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             deterministic=deterministic,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            **kwargs,
         )
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
-        # Loss computation - changed to match working implementation
+        # Loss computation
         loss = None
         if labels is not None:
             vocab_size = logits.shape[-1]
@@ -528,39 +523,73 @@ class Qwen2ForCausalLM(nn.Module):
             losses = -jnp.sum(one_hot * nn.log_softmax(shift_logits, axis=-1), axis=-1)
             loss = jnp.sum(losses * mask) / jnp.sum(mask)
 
-        return loss, logits, past_key_values, hidden_states
+        return (loss, logits) + outputs[1:]
+
+    @partial(jax.jit, static_argnames=("self",))
+    def padded_model_step(
+        self,
+        params,
+        input_ids: jnp.ndarray,
+        attention_mask: jnp.ndarray,
+    ):
+        """
+        Single-step forward pass using fixed-size padded `input_ids`.
+        Returns logits for sampling instead of directly sampling.
+        """
+        outputs = self.apply(
+            {"params": params},
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            deterministic=True,
+        )
+        logits = outputs[1]
+
+        # Get the current sequence length (excluding padding)
+        curr_seq_len = jnp.sum(attention_mask, axis=-1)
+
+        # Focus on the logits at the current position
+        batch_indices = jnp.arange(logits.shape[0])
+        next_token_logits = logits[batch_indices, curr_seq_len - 1]
+        return next_token_logits
 
     def generate(
         self,
+        params,
         input_ids: jnp.ndarray,
         max_new_tokens: int,
         temperature: float = 1.0,
         do_sample: bool = False,
         top_k: Optional[int] = None,
         prng_key: Optional[jax.random.PRNGKey] = None,
-        **kwargs,
     ) -> jnp.ndarray:
-        """Generate tokens autoregressively."""
-        print("input_ids", input_ids)
-        print("GENERATE")
+        """
+        Use fixed-size padded generation with sampling options.
+        """
+        # Determine the padded shape
+        max_sequence_length = input_ids.shape[1] + max_new_tokens
 
-        generated = input_ids
-        past = None
+        # Prepare padded buffers
+        padded_input = jnp.pad(
+            input_ids,
+            ((0, 0), (0, max_sequence_length - input_ids.shape[1])),
+            constant_values=0,
+        )
+        attention_mask = jnp.ones_like(input_ids)
+        attention_mask = jnp.pad(
+            attention_mask,
+            ((0, 0), (0, max_sequence_length - attention_mask.shape[1])),
+            constant_values=0,
+        )
 
-        for _ in tqdm(range(max_new_tokens)):
-            # Get input for current step
-            input_ids_cond = generated if past is None else generated[:, -1:]
-
-            # Model forward pass
-            _, logits, past, _ = self(
-                input_ids=input_ids_cond,
-                past_key_values=past,
-                deterministic=True,
-                **kwargs,
+        # Autoregressive loop
+        for i in tqdm(range(max_sequence_length - input_ids.shape[1])):
+            # Get logits from JIT-compiled single-step
+            next_token_logits = self.padded_model_step(
+                params, padded_input, attention_mask
             )
 
-            # Get logits for last token and scale by temperature
-            next_token_logits = logits[:, -1, :] / temperature
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
 
             # Optionally apply top-k
             if top_k is not None:
@@ -580,8 +609,26 @@ class Qwen2ForCausalLM(nn.Module):
             else:
                 next_token = jnp.argmax(probs, axis=-1)
 
-            # Append generated token
-            next_token = next_token[:, None]  # Add sequence dimension
-            generated = jnp.concatenate([generated, next_token], axis=1)
+            # Reshape next token and update sequences
+            next_token = next_token.reshape(1, 1)
+            already_generated = jnp.concatenate([input_ids, next_token], axis=1)
 
-        return generated
+            # Update padded input for next iteration
+            padded_input = jnp.pad(
+                already_generated,
+                ((0, 0), (0, max_sequence_length - already_generated.shape[1])),
+                constant_values=0,
+            )
+
+            # Update attention mask
+            new_attention = jnp.ones_like(already_generated)
+            attention_mask = jnp.pad(
+                new_attention,
+                ((0, 0), (0, max_sequence_length - new_attention.shape[1])),
+                constant_values=0,
+            )
+
+            # Update input_ids for next iteration
+            input_ids = already_generated
+
+        return input_ids

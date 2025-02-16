@@ -191,7 +191,7 @@ def convert_model_cpu(flax_model, torch_model):
     return converted_params
 
 
-def main():
+def torch_to_flax():
 
     # Load the PyTorch model
     model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -211,4 +211,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    torch_to_flax()
