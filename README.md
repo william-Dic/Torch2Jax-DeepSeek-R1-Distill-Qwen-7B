@@ -52,10 +52,7 @@ This repository provides both Flax (JAX) and PyTorch implementations of the Deep
     - `inference.ipynb`: Contains a quickstart script to download and convert params from torch to flax, load model and perform text generation.
 
 - **Flax Implementations**:  
-    - `model_flax_sharded.py`: [RECOMMENDED] A variant which shards the model parameters over multiple devices.
-    - `model_flax.py`: A version with dynamic caching for efficient autoregressive generation.  
-    - `model_flax_no_cache.py`: A variant without caching support.
-
+    - `model_flax.py`: The Flax implementation.  
 
 - **PyTorch Implementation**:  
     - `model_torch.py`: A reference implementation in PyTorch.
