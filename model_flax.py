@@ -1,73 +1,45 @@
+import jax
+from jax import lax
+import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
+from jax.sharding import Mesh
+from jax.sharding import NamedSharding
+from jax.experimental.pjit import pjit
+
+import flax
+import flax.linen as nn
+
 from typing import Any, Optional, Tuple
 from functools import partial
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
-from jax import lax
 from rich import print
 from tqdm import tqdm
-import jax.numpy as jnp
-from typing import Any, Optional, Tuple
+import numpy as np
 
 
-class DynamicCache:
-    """
-    A cache that grows dynamically as more tokens are generated.
-    For each layer, we store the entire (concatenated) key and value so far.
-    """
-
-    def __init__(self, num_hidden_layers: Optional[int] = None):
-        self._seen_tokens = 0
-        self.key_cache = []
-        self.value_cache = []
-
-    def update(
-        self,
-        key_states: jnp.ndarray,
-        value_states: jnp.ndarray,
-        layer_idx: int,
-        cache_kwargs: Optional[dict] = None,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Concatenate new `key_states`/`value_states` onto the existing cache.
-        Expects shape [batch, heads, new_seq_len, head_dim].
-        """
-        batch_size, heads, new_seq_len, head_dim = key_states.shape
-        # Only layer 0’s update indicates how many new tokens were appended:
-        if layer_idx == 0:
-            self._seen_tokens += new_seq_len
-
-        # Ensure lists are long enough
-        while len(self.key_cache) <= layer_idx:
-            self.key_cache.append(None)
-            self.value_cache.append(None)
-
-        old_k = self.key_cache[layer_idx]
-        old_v = self.value_cache[layer_idx]
-
-        if old_k is None:
-            # No cache yet
-            self.key_cache[layer_idx] = key_states
-            self.value_cache[layer_idx] = value_states
-        else:
-            self.key_cache[layer_idx] = jnp.concatenate([old_k, key_states], axis=-2)
-            self.value_cache[layer_idx] = jnp.concatenate(
-                [old_v, value_states], axis=-2
-            )
-
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
-
-    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        """
-        Returns how many (time-)tokens are cached at a given layer.
-        """
-        if layer_idx >= len(self.key_cache) or self.key_cache[layer_idx] is None:
-            return 0
-        return self.key_cache[layer_idx].shape[-2]
-
-    def total_seq_length(self) -> int:
-        """Returns how many tokens have been seen (for the first layer)."""
-        return self._seen_tokens
+# Define partition rules
+def get_partition_rules():
+    """Returns partitioning rules for the model parameters."""
+    return [
+        # Embeddings
+        ("embed_tokens/embedding", P("mp", None)),
+        # Attention layers
+        ("self_attn/q_proj/kernel", P("mp", None)),
+        ("self_attn/k_proj/kernel", P("mp", None)),
+        ("self_attn/v_proj/kernel", P("mp", None)),
+        ("self_attn/o_proj/kernel", P(None, "mp")),
+        # MLP layers
+        ("mlp/gate_proj/kernel", P("mp", None)),
+        ("mlp/up_proj/kernel", P("mp", None)),
+        ("mlp/down_proj/kernel", P(None, "mp")),
+        # Layer norms (not sharded)
+        ("input_layernorm/weight", None),
+        ("post_attention_layernorm/weight", None),
+        ("norm/weight", None),
+        # LM head
+        ("lm_head/kernel", P(None, "mp")),
+        # Default rule
+        (".*", None),
+    ]
 
 
 class Qwen2Config:
@@ -99,6 +71,7 @@ class Qwen2Config:
         self.attention_dropout = attention_dropout
 
 
+# Modified RMSNorm to support sharding
 class Qwen2RMSNorm(nn.Module):
     hidden_size: int
     eps: float = 1e-6
@@ -120,6 +93,7 @@ class Qwen2RMSNorm(nn.Module):
         return (self.weight * hidden_states).astype(input_dtype)
 
 
+# Modified MLP with sharding support
 class Qwen2MLP(nn.Module):
     config: Qwen2Config
     param_dtype: jnp.dtype = jnp.float32
@@ -212,10 +186,8 @@ class Qwen2Attention(nn.Module):
         hidden_states: jnp.ndarray,
         position_embeddings: Tuple[jnp.ndarray, jnp.ndarray],
         attention_mask: Optional[jnp.ndarray] = None,
-        past_key_value: Optional[DynamicCache] = None,
         deterministic: bool = True,
         output_attentions: bool = False,
-        **kwargs,
     ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
         batch_size, seq_length = hidden_states.shape[:2]
 
@@ -238,12 +210,6 @@ class Qwen2Attention(nn.Module):
             query_states, key_states, cos, sin
         )
 
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
         key_states = self.repeat_kv(key_states, self.num_key_value_groups)
         value_states = self.repeat_kv(value_states, self.num_key_value_groups)
 
@@ -252,12 +218,12 @@ class Qwen2Attention(nn.Module):
             jnp.matmul(query_states, key_states.transpose(0, 1, 3, 2)) * self.scaling
         )
 
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+        attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.softmax(attn_weights, axis=-1)
 
         if not deterministic and self.config.attention_dropout > 0:
+
             attn_weights = nn.dropout(
                 attn_weights,
                 rate=self.config.attention_dropout,
@@ -304,25 +270,19 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: jnp.ndarray,
         attention_mask: Optional[jnp.ndarray] = None,
         position_ids: Optional[jnp.ndarray] = None,
-        past_key_value: Optional[DynamicCache] = None,
         deterministic: bool = True,
         output_attentions: bool = False,
         position_embeddings: Optional[Tuple[jnp.ndarray, jnp.ndarray]] = None,
-        **kwargs,
     ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
-        # Self Attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
             deterministic=deterministic,
             output_attentions=output_attentions,
             position_embeddings=position_embeddings,
-            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -337,6 +297,28 @@ class Qwen2DecoderLayer(nn.Module):
             outputs += (self_attn_weights,)
 
         return outputs
+
+
+# Keep original RMSNorm implementation
+class Qwen2RMSNorm(nn.Module):
+    hidden_size: int
+    eps: float = 1e-6
+    param_dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        self.weight = self.param(
+            "weight",
+            nn.initializers.ones,
+            (self.hidden_size,),
+            self.param_dtype,
+        )
+
+    def __call__(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.astype(jnp.float32)
+        variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
+        hidden_states = hidden_states * lax.rsqrt(variance + self.eps)
+        return (self.weight * hidden_states).astype(input_dtype)
 
 
 class Qwen2Model(nn.Module):
@@ -367,7 +349,6 @@ class Qwen2Model(nn.Module):
         )
 
     def _compute_rope_embeddings(self, hidden_states, position_ids, inv_freq=None):
-        # Compute RoPE embeddings
         if inv_freq is None:
             dim = self.config.hidden_size // self.config.num_attention_heads
             inv_freq = 1.0 / (
@@ -384,90 +365,87 @@ class Qwen2Model(nn.Module):
 
         return cos, sin
 
-    def _prepare_4d_causal_attention_mask(
+    def _prepare_causal_attention_mask(
         self,
-        attention_mask: jnp.ndarray,
+        attention_mask: Optional[jnp.ndarray],
         sequence_length: int,
-        target_length: int,
         dtype: jnp.dtype,
         batch_size: int,
-        cache_position: jnp.ndarray,
     ):
         min_dtype = jnp.finfo(dtype).min
-        causal_mask = jnp.full(
-            (sequence_length, target_length),
-            min_dtype,
-            dtype=dtype,
+        causal_mask = jnp.triu(
+            jnp.full((sequence_length, sequence_length), min_dtype, dtype=dtype),
+            k=1,
         )
-
-        diagonal_attend_mask = jnp.arange(target_length) > cache_position.reshape(-1, 1)
-        causal_mask = jnp.where(diagonal_attend_mask, causal_mask, 0)
         causal_mask = jnp.broadcast_to(
             causal_mask[None, None, :, :],
-            (batch_size, 1, sequence_length, target_length),
+            (batch_size, 1, sequence_length, sequence_length),
         )
+
+        if attention_mask is not None:
+            causal_mask = causal_mask + attention_mask
 
         return causal_mask
 
     def __call__(
         self,
-        input_ids: jnp.ndarray = None,
+        input_ids: jnp.ndarray,
         attention_mask: Optional[jnp.ndarray] = None,
         position_ids: Optional[jnp.ndarray] = None,
-        past_key_values: Optional[DynamicCache] = None,
         inputs_embeds: Optional[jnp.ndarray] = None,
         deterministic: bool = True,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
-        **kwargs,
     ):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if past_key_values is None:
-            past_key_values = DynamicCache()
-
-        past_seen_tokens = past_key_values.get_seq_length()
-        cache_position = jnp.arange(
-            past_seen_tokens,
-            past_seen_tokens + inputs_embeds.shape[1],
-        )
-
         if position_ids is None:
-            position_ids = jnp.expand_dims(cache_position, 0)
+            position_ids = jnp.arange(inputs_embeds.shape[1])[None, :]
 
         # Create causal mask
-        causal_mask = self._prepare_4d_causal_attention_mask(
+        causal_mask = self._prepare_causal_attention_mask(
             attention_mask,
             inputs_embeds.shape[1],
-            inputs_embeds.shape[1] + past_seen_tokens,
             inputs_embeds.dtype,
             inputs_embeds.shape[0],
-            cache_position,
         )
 
         hidden_states = inputs_embeds
-
-        # Create position embeddings to be shared across layers
         position_embeddings = self._compute_rope_embeddings(hidden_states, position_ids)
 
-        # Process through layers
+        all_hidden_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+
         for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_values,
                 deterministic=deterministic,
                 output_attentions=output_attentions,
                 position_embeddings=position_embeddings,
-                **kwargs,
             )
             hidden_states = layer_outputs[0]
 
+            if output_attentions:
+                all_attentions += (layer_outputs[1],)
+
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, past_key_values
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        outputs = (hidden_states,)
+        if output_hidden_states:
+            outputs += (all_hidden_states,)
+        if output_attentions:
+            outputs += (all_attentions,)
+
+        return outputs
 
 
 class Qwen2ForCausalLM(nn.Module):
@@ -486,71 +464,11 @@ class Qwen2ForCausalLM(nn.Module):
             param_dtype=self.param_dtype,
         )
 
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
-        position_ids: Optional[jnp.ndarray] = None,
-        inputs_embeds: Optional[jnp.ndarray] = None,
-        labels: Optional[jnp.ndarray] = None,
-        deterministic: bool = True,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-    ):
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            deterministic=deterministic,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-        )
-
+    def __call__(self, *args, **kwargs):
+        outputs = self.model(*args, **kwargs)
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-
-        # Loss computation
-        loss = None
-        if labels is not None:
-            vocab_size = logits.shape[-1]
-            # Shift logits and labels
-            shift_logits = logits[..., :-1, :].reshape(-1, vocab_size)
-            shift_labels = labels[..., 1:].reshape(-1)
-
-            one_hot = jax.nn.one_hot(shift_labels, vocab_size)
-            mask = shift_labels != -1  # Assuming -1 is the padding token
-            losses = -jnp.sum(one_hot * nn.log_softmax(shift_logits, axis=-1), axis=-1)
-            loss = jnp.sum(losses * mask) / jnp.sum(mask)
-
-        return (loss, logits) + outputs[1:]
-
-    @partial(jax.jit, static_argnames=("self",))
-    def padded_model_step(
-        self,
-        params,
-        input_ids: jnp.ndarray,
-        attention_mask: jnp.ndarray,
-    ):
-        """
-        Single-step forward pass using fixed-size padded `input_ids`.
-        Returns logits for sampling instead of directly sampling.
-        """
-        outputs = self.apply(
-            {"params": params},
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            deterministic=True,
-        )
-        logits = outputs[1]
-
-        # Get the current sequence length (excluding padding)
-        curr_seq_len = jnp.sum(attention_mask, axis=-1)
-
-        # Focus on the logits at the current position
-        batch_indices = jnp.arange(logits.shape[0])
-        next_token_logits = logits[batch_indices, curr_seq_len - 1]
-        return next_token_logits
+        return (logits,) + outputs[1:]
 
     def generate(
         self,
@@ -563,12 +481,17 @@ class Qwen2ForCausalLM(nn.Module):
         prng_key: Optional[jax.random.PRNGKey] = None,
     ) -> jnp.ndarray:
         """
-        Use fixed-size padded generation with sampling options.
+        Optimized generation using fixed-size padding and sharding.
         """
+        # Create device mesh
+        devices = jax.devices()
+        mesh = Mesh(devices, ("mp",))
+
         # Determine the padded shape
         max_sequence_length = input_ids.shape[1] + max_new_tokens
+        batch_size = input_ids.shape[0]
 
-        # Prepare padded buffers
+        # Create padded buffers
         padded_input = jnp.pad(
             input_ids,
             ((0, 0), (0, max_sequence_length - input_ids.shape[1])),
@@ -581,17 +504,46 @@ class Qwen2ForCausalLM(nn.Module):
             constant_values=0,
         )
 
-        # Autoregressive loop
-        for i in tqdm(range(max_sequence_length - input_ids.shape[1])):
-            # Get logits from JIT-compiled single-step
-            next_token_logits = self.padded_model_step(
-                params, padded_input, attention_mask
+        # Define sharding for the padded forward pass
+        input_spec = NamedSharding(mesh, P(None, None))  # (batch, padded_seq_len)
+
+        # Create parameter spec (matches structure of `params` which is already {'params': ...})
+        def create_param_spec(p):
+            if isinstance(p, dict):
+                return {k: create_param_spec(v) for k, v in p.items()}
+            return NamedSharding(mesh, P())  # default spec
+
+        param_spec = create_param_spec(params)
+
+        # Create JIT-compiled step function with pjit
+        @partial(
+            pjit,
+            in_shardings=(param_spec, input_spec, input_spec),
+            out_shardings=NamedSharding(mesh, P(None, None)),
+        )
+        def sharded_step(sharded_params, padded_ids, attn_mask):
+            # `sharded_params` is the same structure as `params` => {"params": ...}
+            # Pass it directly to self.apply()
+            outputs = self.apply(
+                sharded_params,  # No extra nesting!
+                input_ids=padded_ids,
+                attention_mask=attn_mask,
+                deterministic=True,
             )
+            # `outputs` is (logits, final_hidden, ...)
+            logits = outputs[0]  # The first item is the final logits
+
+            # Current seq-length from the attention_mask
+            curr_seq_len = jnp.sum(attn_mask, axis=-1)
+
+            # Grab logits at the current position
+            batch_indices = jnp.arange(logits.shape[0])
+            next_token_logits = logits[batch_indices, curr_seq_len - 1]
 
             # Apply temperature
             next_token_logits = next_token_logits / temperature
 
-            # Optionally apply top-k
+            # Apply top-k if specified
             if top_k is not None:
                 top_logits, _ = jax.lax.top_k(next_token_logits, top_k)
                 k_threshold = jnp.min(top_logits, axis=-1, keepdims=True)
@@ -599,36 +551,33 @@ class Qwen2ForCausalLM(nn.Module):
                     next_token_logits < k_threshold, -jnp.inf, next_token_logits
                 )
 
-            # Convert to probabilities
-            probs = jax.nn.softmax(next_token_logits, axis=-1)
+            return next_token_logits
 
-            # Sample or take argmax
-            if do_sample and prng_key is not None:
-                prng_key, subkey = jax.random.split(prng_key)
-                next_token = jax.random.categorical(subkey, next_token_logits, axis=-1)
-            else:
-                next_token = jnp.argmax(probs, axis=-1)
+        # Autoregressive generation loop
+        current_input_length = input_ids.shape[1]
 
-            # Reshape next token and update sequences
-            next_token = next_token.reshape(1, 1)
-            already_generated = jnp.concatenate([input_ids, next_token], axis=1)
+        with mesh:
+            for i in tqdm(range(max_new_tokens)):
+                # Get next token logits via sharded computation
+                next_token_logits = sharded_step(params, padded_input, attention_mask)
 
-            # Update padded input for next iteration
-            padded_input = jnp.pad(
-                already_generated,
-                ((0, 0), (0, max_sequence_length - already_generated.shape[1])),
-                constant_values=0,
-            )
+                # Sample or argmax
+                if do_sample and prng_key is not None:
+                    prng_key, subkey = jax.random.split(prng_key)
+                    next_token = jax.random.categorical(
+                        subkey, next_token_logits, axis=-1
+                    )
+                else:
+                    next_token = jnp.argmax(next_token_logits, axis=-1)
 
-            # Update attention mask
-            new_attention = jnp.ones_like(already_generated)
-            attention_mask = jnp.pad(
-                new_attention,
-                ((0, 0), (0, max_sequence_length - new_attention.shape[1])),
-                constant_values=0,
-            )
+                # Place next token into padded_input
+                next_token = next_token[:, None]
+                current_input_length += 1
 
-            # Update input_ids for next iteration
-            input_ids = already_generated
+                padded_input = padded_input.at[:, current_input_length - 1].set(
+                    next_token[:, 0]
+                )
+                attention_mask = attention_mask.at[:, current_input_length - 1].set(1)
 
-        return input_ids
+        # Return only the actual sequence (remove padding)
+        return padded_input[:, :current_input_length]
