@@ -71,7 +71,6 @@ class Qwen2Config:
         self.attention_dropout = attention_dropout
 
 
-# Modified RMSNorm to support sharding
 class Qwen2RMSNorm(nn.Module):
     hidden_size: int
     eps: float = 1e-6
@@ -297,28 +296,6 @@ class Qwen2DecoderLayer(nn.Module):
             outputs += (self_attn_weights,)
 
         return outputs
-
-
-# Keep original RMSNorm implementation
-class Qwen2RMSNorm(nn.Module):
-    hidden_size: int
-    eps: float = 1e-6
-    param_dtype: jnp.dtype = jnp.float32
-
-    def setup(self):
-        self.weight = self.param(
-            "weight",
-            nn.initializers.ones,
-            (self.hidden_size,),
-            self.param_dtype,
-        )
-
-    def __call__(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(jnp.float32)
-        variance = jnp.mean(jnp.square(hidden_states), axis=-1, keepdims=True)
-        hidden_states = hidden_states * lax.rsqrt(variance + self.eps)
-        return (self.weight * hidden_states).astype(input_dtype)
 
 
 class Qwen2Model(nn.Module):
